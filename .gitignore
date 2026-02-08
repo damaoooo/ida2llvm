@@ -1,2 +1,7 @@
 *.i64
 examples/
+
+__pycache__/
+*.pyc
+
+*.ll

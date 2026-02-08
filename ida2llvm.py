@@ -18,8 +18,8 @@ import idaapi
 import logging
 import struct
 import numpy as np
-import argparse
 import sys
+import typer
 import llvmlite.binding as llvm
 from llvmlite import ir
 
@@ -1753,74 +1753,56 @@ class BIN2LLVMController():
         with open(filename, 'w') as f:
             f.write(str(self.m))
 
-if __name__ == "__main__":
+app = typer.Typer(
+    add_completion=False,
+    help="IDA2LLVM - Convert binary to LLVM IR using IDA Pro 9+ idalib",
+)
+
+
+@app.command()
+def main(
+    file: str = typer.Option(
+        ..., "-f", "--file", help="Binary file to be analyzed"
+    ),
+    output: str = typer.Option(
+        ..., "-o", "--output", help="Output file for LLVM IR (.ll)"
+    ),
+    verbose: bool = typer.Option(
+        False, "-v", "--verbose", help="Enable verbose logging"
+    ),
+    target: str = typer.Option(
+        "host", "--target", help="Target triple source: host (default) or ida"
+    ),
+):
     """
     作为独立应用程序运行（使用 IDA Pro 9+ idalib）。
-    
-    用法：
-        python ida2llvm.py -f binary_file -o output.ll
-    
-    参数：
-        -f, --file: 要分析的二进制文件路径（required）
-        -o, --output: 生成的LLVM IR文件的输出路径（required）
-    
-    流程：
-        1. 使用 idalib 打开数据库并进行自动分析
-        2. 初始化控制器并准备元数据
-        3. 将所有.text段函数提升为LLVM IR
-        4. 将IR模块保存到指定文件
-        5. 关闭数据库
     """
-    # 解析命令行参数
-    parser = argparse.ArgumentParser(
-        description="IDA2LLVM - Convert binary to LLVM IR using IDA Pro 9+ idalib"
-    )
-    parser.add_argument(
-        "-f", "--file", 
-        help="Binary file to be analyzed", 
-        type=str, 
-        required=True
-    )
-    parser.add_argument(
-        "-o", "--output", 
-        help="Output file for LLVM IR (.ll)", 
-        type=str, 
-        required=True
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        help="Enable verbose logging",
-        action="store_true",
-        default=False
-    )
-    parser.add_argument(
-        "--target",
-        help="Target triple source: host (default) or ida",
-        choices=["host", "ida"],
-        default="host"
-    )
-    
-    args = parser.parse_args()
-    
-    # 配置日志
-    if args.verbose:
+    if target not in ("host", "ida"):
+        raise typer.BadParameter("must be one of: host, ida")
+
+    if verbose:
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.INFO)
-    
+
     try:
-        idapro.open_database(args.file, True)
+        idapro.open_database(file, True)
         ida_auto.auto_wait()
-        bin2llvm = BIN2LLVMController(target_mode=args.target)
+        bin2llvm = BIN2LLVMController(target_mode=target)
         bin2llvm.initialize()
         bin2llvm.insertAllFunctions()
-        bin2llvm.save_to_file(args.output)
-        
+        bin2llvm.save_to_file(output)
+
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
     finally:
         idapro.close_database()
+
+
+if __name__ == "__main__":
+    app()
 
