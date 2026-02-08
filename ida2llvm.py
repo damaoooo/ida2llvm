@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+import idapro  # 必须是第一个 import，用于 idalib
 import idc
 import ida_idaapi
 import ida_kernwin
@@ -10,29 +12,42 @@ import ida_typeinf
 import ida_segment
 import ida_nalt
 import ida_hexrays
+import ida_auto
 import itertools
 import idaapi
 import logging
 import struct
 import numpy as np
+import argparse
+import sys
 import llvmlite.binding as llvm
 from llvmlite import ir
 
 from contextlib import suppress
 
+# ============================================================================
+# 常量定义
+# ============================================================================
 i8ptr = ir.IntType(8).as_pointer()
-ptrsize = 64 if ida_idaapi.get_inf_structure().is_64bit() else 32
-ptext = {}
+ptrsize = 64 if ida_ida.inf_is_64bit() else 32
+ptext = {}  # 缓存反编译的函数: {地址: 反编译结果}
+refreshed_funcs = set()  # 避免重复触发无缓存反编译
+
+# 线程局部存储段大小（Windows FS段标准大小）
+FS_SEGMENT_SIZE = 0x10000  # 64KB
+
+# 浮点数提取失败时的默认值
+DEFAULT_FLOAT_VALUE = 1.0
 
 def lift_tif(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
     """
-    Lifts the given IDA type to corresponding LLVM type.
-    If IDA type is an array/struct/tif, type lifting is performed recursively.
+    将IDA类型转换为对应的LLVM类型。
+    如果IDA类型是数组/结构体/复合类型，则递归执行类型转换。
 
-    :param tif: the type to lift, in IDA
+    :param tif: 要转换的IDA类型
     :type tif: ida_typeinf.tinfo_t
-    :raises NotImplementedError: variadic structs
-    :return: lifted LLVM type
+    :raises NotImplementedError: 不支持可变长度结构体
+    :return: 转换后的LLVM类型
     :rtype: ir.Type
     """
     if tif.is_func():
@@ -54,7 +69,7 @@ def lift_tif(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
         element = lift_tif(child_tif)
         count = tif.get_array_nelems()
         if count == 0:
-            # an array with an indeterminate number of elements = type pointer
+            # 元素数量不确定的数组 = 指针类型
             tif.convert_array_to_ptr()
             return lift_tif(tif)      
         return ir.ArrayType(element, count)
@@ -97,7 +112,7 @@ def lift_tif(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
         return ir.DoubleType()
 
     # elif tif.is_ldouble():
-    #     return ir.DoubleType()
+    #     return ir.DoubleType()  # llvmlite不支持long double
 
     elif tif.is_decl_int() or tif.is_decl_uint() or tif.is_uint() or tif.is_int():
         return ir.IntType(tif.get_size()*8)
@@ -115,29 +130,38 @@ def lift_tif(tif: ida_typeinf.tinfo_t, width = -1) -> ir.Type:
         return ir.IntType(tif.get_size()*8)
 
     elif tif.is_ext_arithmetic() or tif.is_arithmetic():
-        return ir.IntType(tif.get_size()*8)
+        size_bits = tif.get_size() * 8
+        # 防止创建过大的整数类型（限制为128位）
+        if size_bits > 128 or size_bits <= 0:
+            # logging.warning(f"Invalid type size {tif.get_size()} bytes, using pointer size instead")
+            return ir.IntType(ptrsize)
+        return ir.IntType(size_bits)
         
     else:
         if width != -1:
+            # 防止创建过大的数组（限制为1MB）
+            if width > 1024 * 1024 or width <= 0:
+                # logging.warning(f"Invalid array width {width} bytes, using pointer type instead")
+                return ir.IntType(ptrsize)
             return ir.ArrayType(ir.IntType(8), width)
         else:
             return ir.IntType(ptrsize)
 
 def typecast(src: ir.Value, dst_type: ir.Type, builder: ir.IRBuilder, signed: bool = False) -> ir.Value:
     """
-    Given some `src`, convert it to type `dst_type`.
-    Instructions are emitted into `builder`.
+    将源值转换为目标类型。
+    转换指令会被插入到builder中。
 
-    :param src: value to convert
+    :param src: 要转换的值
     :type src: ir.Value
-    :param dst_type: destination type
+    :param dst_type: 目标类型
     :type dst_type: ir.Type
-    :param builder: builds instructions
+    :param builder: 指令构建器
     :type builder: ir.IRBuilder
-    :param signed: whether to preserve signness, defaults to True
+    :param signed: 是否保留符号性，默认False
     :type signed: bool, optional
-    :raises NotImplementedError: type conversion not supported
-    :return: value after typecast
+    :raises NotImplementedError: 不支持的类型转换
+    :return: 类型转换后的值
     :rtype: ir.Value   
     """
     if src.type != dst_type:
@@ -207,7 +231,7 @@ def typecast(src: ir.Value, dst_type: ir.Type, builder: ir.IRBuilder, signed: bo
 
 def storecast(src, dst, builder):
     """
-    This function cast type of dst into pointer of src.
+    将目标的类型转换为源的指针类型。
     """
     if dst != None and dst.type != src.type.as_pointer():
         dst = typecast(dst, src.type.as_pointer(), builder) 
@@ -215,13 +239,13 @@ def storecast(src, dst, builder):
 
 def get_offset_to(builder: ir.IRBuilder, arg: ir.Value, off: int = 0) -> ir.Value:
     """
-    A Value can be indexed relative to some offset.
+    根据偏移量对值进行索引。
 
-    :param arg: value to index from
+    :param arg: 要索引的值
     :type arg: ir.Value
-    :param off: offset to index, defaults to 0
+    :param off: 索引偏移量，默认为0
     :type off: int, optional
-    :return: value after indexing by off
+    :return: 按偏移量索引后的值
     :rtype: ir.Value
     """
     if isinstance(arg.type, ir.PointerType) and isinstance(arg.type.pointee, ir.ArrayType):
@@ -242,17 +266,19 @@ def get_offset_to(builder: ir.IRBuilder, arg: ir.Value, off: int = 0) -> ir.Valu
 
 def dedereference(arg: ir.Value) -> ir.Value:
     """
-    A memory address is deferenced if the memory at the address is loaded.
-    In LLVM, a LoadInstruction instructs the CPU to perform the dereferencing.
+    "反解引用"操作：从已加载的值中获取原始内存地址。
+    
+    在LLVM中，LoadInstruction会从内存地址加载值（解引用）。
+    当我们需要获取原始内存地址时，需要"反解引用"。
+    
+    需要这个操作的原因：
+    - IDA微代码将所有局部变量(LVARS)视为寄存器
+    - 而在提升时我们将所有LVARS视为栈变量（符合LLVM SSA形式）
 
-    In cases where we wish to retrieve the memory address, we "de-dereference".
-    - this is needed as IDA microcode treats all LVARS as registers
-    - whereas during lifting we treat all LVARS as stack variables (in accordance to LLVM SSA)
-
-    :param arg: value to de-dereference
+    :param arg: 需要反解引用的值
     :type arg: ir.Value
-    :raises NotImplementedError: arg is not of type LoadInstr
-    :return: original memory address
+    :raises NotImplementedError: 参数不是LoadInstr类型
+    :return: 原始内存地址
     :rtype: ir.Value
     """
     if isinstance(arg, ir.LoadInstr):
@@ -264,8 +290,9 @@ def dedereference(arg: ir.Value) -> ir.Value:
 
 
 def lift_type_from_address(ea: int, pfunc=None):
+    """从地址获取类型信息。"""
     if ida_funcs.get_func(ea) != None and ida_segment.segtype(ea) & ida_segment.SEG_XTRN:
-        # let's assume its a function that returns ONE register and takes in variadic arguments
+        # 假设这是一个返回void且接受可变参数的函数
         ida_func_details = ida_typeinf.func_type_data_t()
         void = ida_typeinf.tinfo_t()
         void.create_simple_type(ida_typeinf.BTF_VOID)
@@ -280,25 +307,36 @@ def lift_type_from_address(ea: int, pfunc=None):
         return ptext[ea].type
             
     tif = ida_typeinf.tinfo_t()
-    ida_nalt.get_tinfo(tif, ea)
-    if not ida_nalt.get_tinfo(tif, ea):
+    has_tinfo = ida_nalt.get_tinfo(tif, ea)
+    if not has_tinfo:
         ida_typeinf.guess_tinfo(tif, ea)
     return tif
 
 def analyze_insn(module, ida_insn, ea):
     """
-    This function analyze is there mismatch function call.
-    A call B with 3 arguments but B has 4 arguments.
-    This typically owing to IDA type propagation, sometimes will be solved by re-decompile.
+    Analyzes function call instructions for parameter count mismatches.
+    
+    Problem: Sometimes IDA's type propagation is incomplete, causing a mismatch
+    between the number of arguments in a call and the function's actual signature.
+    For example, function A calls function B with 3 arguments, but B's signature
+    expects 4 arguments.
+    
+    Solution: Force re-decompilation of both caller and callee to refresh type
+    information and resolve the mismatch.
+    
+    :param module: LLVM module being constructed
+    :param ida_insn: Microcode instruction to analyze
+    :param ea: Address of the instruction
     """
     if ida_insn.opcode == ida_hexrays.m_call:
         callnum = len(ida_insn.d.f.args)
         if ida_insn.l.t == ida_hexrays.mop_v: 
             temp_ea = ida_insn.l.g
             func_name = ida_name.get_name(temp_ea)
-            if ((ida_funcs.get_func(temp_ea) is not None)
-            and (ida_funcs.get_func(temp_ea).flags & ida_funcs.FUNC_THUNK)): 
-                tfunc_ea, ptr = ida_funcs.calc_thunk_func_target(ida_funcs.get_func(temp_ea))
+            temp_func = ida_funcs.get_func(temp_ea)
+            if ((temp_func is not None)
+            and (temp_func.flags & ida_funcs.FUNC_THUNK)): 
+                tfunc_ea, ptr = ida_funcs.calc_thunk_func_target(temp_func)
                 if tfunc_ea != ida_idaapi.BADADDR:
                     temp_ea = tfunc_ea
                     func_name = ida_name.get_name(temp_ea)
@@ -315,19 +353,25 @@ def analyze_insn(module, ida_insn, ea):
 
                 if callnum != argnum:
                     ida_hf = ida_hexrays.hexrays_failure_t()
-                    try:
-                        pfunc = ida_hexrays.decompile(temp_ea, ida_hf, ida_hexrays.DECOMP_NO_CACHE)
-                        if pfunc != None:
-                            ptext[temp_ea] = pfunc
-                    except:
-                        pass
+                    if temp_ea not in refreshed_funcs:
+                        refreshed_funcs.add(temp_ea)
+                        try:
+                            # 重新反编译被调用函数
+                            pfunc = ida_hexrays.decompile(temp_ea, ida_hf, ida_hexrays.DECOMP_NO_CACHE)
+                            if pfunc != None:
+                                ptext[temp_ea] = pfunc
+                        except:
+                            pass
 
-                    try:
-                        pfunc = ida_hexrays.decompile(ea, ida_hf, ida_hexrays.DECOMP_NO_CACHE) 
-                        if pfunc != None:
-                            ptext[ea] = pfunc
-                    except:
-                        return
+                    if ea not in refreshed_funcs:
+                        refreshed_funcs.add(ea)
+                        try:
+                            # 重新反编译调用者函数
+                            pfunc = ida_hexrays.decompile(ea, ida_hf, ida_hexrays.DECOMP_NO_CACHE) 
+                            if pfunc != None:
+                                ptext[ea] = pfunc
+                        except:
+                            return
 
     if ida_insn.l.t == ida_hexrays.mop_d:
         analyze_insn(module, ida_insn.l.d, ea)
@@ -468,49 +512,48 @@ def _lift_from_address(module: ir.Module, ea: int, typ: ir.Type):
     else:
         raise NotImplementedError(f"object at {hex(ea)} is of unsupported type {typ}")
 
-def str2size(str_size: str):
+def str2size(str_size: str) -> int:
     """
-    Converts a string representing memory size into its size in bits. 
+    将表示内存大小的字符串转换为位数。
 
-    :param str_size: string describing size
+    :param str_size: 描述大小的字符串
     :type str_size: str
-    :return: size of string, in bits
+    :return: 字符串的大小，以位为单位
     :rtype: int
     """
-    if str_size == "byte":
-        return 8
-    elif str_size == "word":
-        return 16
-    elif str_size == "dword":
-        return 32
-    elif str_size == "qword":
-        return 64
-    else:
-        raise AssertionError("string size must be one of byte/word/dword/qword")
+    size_map = {
+        "byte": 8,
+        "word": 16,
+        "dword": 32,
+        "qword": 64
+    }
+    if str_size not in size_map:
+        raise AssertionError(f"字符串大小必须是 {list(size_map.keys())} 之一，得到的是 '{str_size}'")
+    return size_map[str_size]
 
 def lift_intrinsic_function(module: ir.Module, func_name: str):
     """
-    Lifts IDA macros to corresponding LLVM intrinsics.
+    将IDA宏转换为LLVM内置函数。
 
-    Hexray's decompiler recognises higher-level functions at the Microcode level.
-        Such ida_hexrays:mop_t objects are typed as ida_hexrays.mop_h (auxillary function member)
-        
-        This improves decompiler output, representing operations that cannot be mapped to nice C code
-        (https://hex-rays.com/blog/igors-tip-of-the-week-67-decompiler-helpers/).
+    Hexray的反编译器在微代码层面识别高级函数。
+    这些 ida_hexrays.mop_t 对象被标记为 ida_hexrays.mop_h（辅助函数成员）
+    
+    这改善了反编译器输出，表示无法映射到良好C代码的操作。
+    （参考: https://hex-rays.com/blog/igors-tip-of-the-week-67-decompiler-helpers/）
 
-        For relevant #define macros, refer to IDA SDK: `defs.h` and `pro.h`.
+    相关的#define宏请参考IDA SDK: `defs.h` 和 `pro.h`。
 
-    LLVM intrinsics have well known names and semantics and are required to follow certain restrictions.
+    LLVM内置函数具有公认的名称和语义，并且必须遵循某些限制。
 
-    :param module: _description_
+    :param module: LLVM模块
     :type module: ir.Module
-    :param func_name: _description_
+    :param func_name: 函数名称
     :type func_name: str
-    :raises NotImplementedError: _description_
-    :return: _description_
-    :rtype: _type_
+    :raises NotImplementedError: 不支持的函数
+    :return: LLVM内置函数
+    :rtype: ir.Function
     """
-    # retrieve intrinsic function if it already exists
+    # 如果已存在，直接返回
     with suppress(KeyError):
         return module.get_global(func_name)
 
@@ -661,7 +704,7 @@ def lift_intrinsic_function(module: ir.Module, func_name: str):
         try:
             fs_reg = module.get_global("virtual_fs")
         except KeyError:
-            fs_reg_typ = ir.ArrayType(ir.IntType(8), 65536)
+            fs_reg_typ = ir.ArrayType(ir.IntType(8), FS_SEGMENT_SIZE)
             fs_reg = ir.GlobalVariable(module, fs_reg_typ, "virtual_fs")
             fs_reg.storage_class = "thread_local"
             fs_reg.initializer = fs_reg_typ(None)            
@@ -698,25 +741,24 @@ def lift_intrinsic_function(module: ir.Module, func_name: str):
         return f
 
     else:
-        raise NotImplementedError(f"NotImplementedError {func_name}")  
+        raise NotImplementedError(f"不支持的内置函数: {func_name}")  
 
 def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None, tif: ida_typeinf.tinfo_t = None):
     """
-    Declares function given its name. 
-    If `is_declare` is False, also define the function by recursively.
-    If `tif` is given, enforce function type as given.
-    lifting its instructions in IDA decompiler output.
-    Heavylifting is done in `lift_from_address`.
+    根据函数名声明函数。
+    如果 `is_declare` 为False，还会通过递归提升其在IDA反编译输出中的指令来定义函数。
+    如果给出了 `tif`，则强制使用给定的函数类型。
+    主要工作在 `lift_from_address` 中完成。
 
-    :param module: parent module of function
+    :param module: 函数的父模块
     :type module: ir.Module
-    :param func_name: name of function to lift
+    :param func_name: 要提升的函数名
     :type func_name: str
-    :param is_declare: is the function declare only?
+    :param is_declare: 是否只是声明函数，不定义
     :type is_declare: bool
-    :param tif: function type, defaults to None
+    :param tif: 函数类型，默认为None
     :type tif: ida_typeinf.tinfo_t, optional
-    :return: lifted function
+    :return: 提升后的函数
     :rtype: ir.Function
     """
     if func_name == "":
@@ -748,7 +790,7 @@ def lift_function(module: ir.Module, func_name: str, is_declare: bool, ea = None
 
 def calc_instsize(typ):
     """
-    This function calculate inst width
+    计算指令宽度（以位为单位）。
     """
     if isinstance(typ, ir.PointerType):
         return ptrsize
@@ -765,16 +807,38 @@ def calc_instsize(typ):
 
 def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest = False, knowntyp = None) -> ir.Value:
     """
-    This function lift mop of microcode into llvm.
+    Lifts a microcode operand (mop) to an LLVM value.
+    
+    Microcode operands come in many types:
+    - mop_n: Immediate values (constants)
+    - mop_r: Register values
+    - mop_l: Local variables (stack-allocated in LLVM)
+    - mop_v: Global variables/functions
+    - mop_S: Stack variables
+    - mop_d: Nested instructions (recursive lifting)
+    - mop_f: Function call information
+    - mop_a: Addresses of other operands
+    - mop_h: Helper/intrinsic functions
+    - mop_str: String constants
+    - mop_c: Switch cases
+    - mop_fn: Floating point constants
+    - mop_p: Pair operations
+    
+    :param mop: The microcode operand to lift
+    :param blk: Current LLVM basic block
+    :param builder: LLVM IR builder
+    :param dest: Whether this operand is a destination (true = return pointer, false = load value)
+    :param knowntyp: Optional known type to cast to
+    :return: Corresponding LLVM value
     """
     builder.position_at_end(blk)
-    if mop.t == ida_hexrays.mop_r: # register value
+    if mop.t == ida_hexrays.mop_r: # 寄存器值
         return None
-    elif mop.t == ida_hexrays.mop_n: # immediate value
+    elif mop.t == ida_hexrays.mop_n: # 立即数
         res = ir.Constant(ir.IntType(mop.size * 8), mop.nnn.value)
         res.parent = blk
         return res
-    elif mop.t == ida_hexrays.mop_d: # another instruction
+    elif mop.t == ida_hexrays.mop_d: # 另一个指令
         d = lift_insn(mop.d, blk, builder)
         if isinstance(d.type, ir.VoidType):
             pass
@@ -788,7 +852,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
         elif calc_instsize(d.type) != mop.size * 8:
             d = typecast(d, ir.IntType(mop.size * 8), builder)
         return d
-    elif mop.t == ida_hexrays.mop_l: # local variables
+    elif mop.t == ida_hexrays.mop_l: # 局部变量
         lvar = mop.l.var()
         name = "funcresult" if lvar.is_result_var else lvar.name
         off = mop.l.off
@@ -802,7 +866,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
         elif calc_instsize(llvm_arg.type.pointee) != mop.size * 8:
             llvm_arg = typecast(llvm_arg, ir.IntType(mop.size * 8).as_pointer(), builder)
         return llvm_arg if dest else builder.load(llvm_arg)
-    elif mop.t == ida_hexrays.mop_S: # stack variables
+    elif mop.t == ida_hexrays.mop_S: # 栈变量
         name = "stack"
         func = blk.parent
         if name not in func.lvars:
@@ -813,16 +877,13 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
         if mop.size == -1:
             pass
         elif knowntyp != None:
-            d = typecast(d, knowntyp, builder)
+            llvm_arg = typecast(llvm_arg, knowntyp, builder)
         elif calc_instsize(llvm_arg.type.pointee) != mop.size * 8:
             llvm_arg = typecast(llvm_arg, ir.IntType(mop.size * 8).as_pointer(), builder)
         return llvm_arg if dest else builder.load(llvm_arg) 
-        if (hasattr(llvm_arg.type.pointee, "width") and llvm_arg.type.pointee.width != mop.size * 8) and mop.size != -1:
-            llvm_arg = typecast(llvm_arg, ir.IntType(mop.size * 8).as_pointer(), builder)
-        return llvm_arg if dest else builder.load(llvm_arg) 
-    elif mop.t == ida_hexrays.mop_b: # block number (used in jmp\call instruction)
+    elif mop.t == ida_hexrays.mop_b: # 基本块编号（用于jmp/call指令）
         return blk.parent.blocks[mop.b]
-    elif mop.t == ida_hexrays.mop_v: # global variable
+    elif mop.t == ida_hexrays.mop_v: # 全局变量
         ea = mop.g
         name = ida_name.get_name(ea)
         if name == "":
@@ -845,13 +906,13 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
                     if name == "":
                         name = f"data_{hex(ea)[2:]}"
                     tif = lift_type_from_address(ea)
-            # if no function definition,
+            # 如果没有函数定义，
             if ((ida_funcs.get_func(ea) is None)
-            # or if the function is a library function,
+            # 或者函数是库函数，
             or (ida_funcs.get_func(ea).flags & ida_funcs.FUNC_LIB) 
-            # or if the function is declared in a XTRN segment,
+            # 或者函数在XTRN段中声明，
             or ida_segment.segtype(ea) & ida_segment.SEG_XTRN): 
-                # return function declaration
+                # 返回函数声明
                 g = lift_function(blk.parent.parent, name, True, ea, tif)
             else:
                 g = lift_function(blk.parent.parent, name, False, ea, tif)
@@ -876,7 +937,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
             elif calc_instsize(g.type.pointee) != mop.size * 8:
                 g = typecast(g, ir.IntType(mop.size * 8).as_pointer(), builder)     
             return g if dest else builder.load(g)
-    elif mop.t == ida_hexrays.mop_f: # function call information
+    elif mop.t == ida_hexrays.mop_f: # 函数调用信息
         mcallinfo = mop.f
         f_args = []
         f_ret = []
@@ -902,7 +963,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
             f_arg = typecast(f_arg, typ, builder)
             f_args.append(f_arg)
         return f_ret, f_args
-    elif mop.t == ida_hexrays.mop_a: # operating number address (mop_l\mop_v\mop_S\mop_r)
+    elif mop.t == ida_hexrays.mop_a: # 操作数地址(mop_l\mop_v\mop_S\mop_r)
         mop_addr = mop.a
         val = lift_mop(mop_addr, blk, builder, True) 
         if isinstance(mop, ida_hexrays.mcallarg_t):
@@ -914,11 +975,11 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
         elif knowntyp != None:
             val = typecast(val, knowntyp, builder)
         return val
-    elif mop.t == ida_hexrays.mop_h: # auxiliary function number
+    elif mop.t == ida_hexrays.mop_h: # 辅助函数编号
         with suppress(NotImplementedError):
             return lift_intrinsic_function(blk.parent.parent, mop.helper)
         return None
-    elif mop.t == ida_hexrays.mop_str: # string constant
+    elif mop.t == ida_hexrays.mop_str: # 字符串常量
         str_csnt = mop.cstr
         strType = ir.ArrayType(ir.IntType(8), len(str_csnt))
         g = ir.GlobalVariable(blk.parent.parent, strType, name=f"cstr_{len(blk.parent.parent.globals)}")
@@ -926,7 +987,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
         g.linkage = "private"
         g.global_constant = True
         return typecast(g, ir.IntType(8).as_pointer(), builder)
-    elif mop.t == ida_hexrays.mop_c: # switch case and target
+    elif mop.t == ida_hexrays.mop_c: # switch分支和目标
         mcases = {}
         for i in range(mop.c.size()):
             dst = mop.c.targets[i]  
@@ -937,17 +998,13 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
                 mcases[src] = dst
         return mcases
     elif mop.t == ida_hexrays.mop_fn:
-        # IDA get float value may be crash in some cases
+        # IDA获取浮点数值在某些情况下可能会崩溃
         try:
             fp = mop.fpc.fnum.float
-        except:
-            fp = 1.0
-        if mop.size == 4:
-            typ = ir.FloatType()
-        elif mop.size == 8:
-            typ = ir.DoubleType()
-        else:
-            typ = ir.DoubleType()
+        except (AttributeError, ValueError) as e:
+            logging.debug(f"Failed to extract float value: {e}, using default {DEFAULT_FLOAT_VALUE}")
+            fp = DEFAULT_FLOAT_VALUE
+        typ = float_type(mop.size)
         return ir.Constant(typ, fp)         
     elif mop.t == ida_hexrays.mop_p:
         f = lift_intrinsic_function(blk.parent.parent, f"__PAIR{mop.size*8}__")
@@ -960,29 +1017,29 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
         pass
     elif mop.t == ida_hexrays.mop_z:
         return None
-    mop_descs = {ida_hexrays.mop_r: "register value",
-                ida_hexrays.mop_n: "immediate value",
-                ida_hexrays.mop_d: "another instruction",
-                ida_hexrays.mop_l: "local variables",
-                ida_hexrays.mop_S: "stack variables",
-                ida_hexrays.mop_b: "block number (used in jmp\call instruction)",
-                ida_hexrays.mop_v: "global variable",
-                ida_hexrays.mop_f: "function call information",
-                ida_hexrays.mop_a: "operating number address (mop_l\mop_v\mop_S\mop_r)",
-                ida_hexrays.mop_h: "auxiliary function number",
-                ida_hexrays.mop_str: "string constant",
-                ida_hexrays.mop_c: "switch case and target",
-                ida_hexrays.mop_fn: "floating points constant",
-                ida_hexrays.mop_p: "the number of operations is correct",
-                ida_hexrays.mop_sc: "decentralized operation information"
+    mop_descs = {ida_hexrays.mop_r: "寄存器值",
+                ida_hexrays.mop_n: "立即数",
+                ida_hexrays.mop_d: "另一个指令",
+                ida_hexrays.mop_l: "局部变量",
+                ida_hexrays.mop_S: "栈变量",
+                ida_hexrays.mop_b: "基本块编号（用于jmp/call指令）",
+                ida_hexrays.mop_v: "全局变量",
+                ida_hexrays.mop_f: "函数调用信息",
+                ida_hexrays.mop_a: r"操作数地址(mop_l\mop_v\mop_S\mop_r)",
+                ida_hexrays.mop_h: "辅助函数编号",
+                ida_hexrays.mop_str: "字符串常量",
+                ida_hexrays.mop_c: "switch分支和目标",
+                ida_hexrays.mop_fn: "浮点常量",
+                ida_hexrays.mop_p: "配对操作",
+                ida_hexrays.mop_sc: "分散操作信息"
     }
-    raise NotImplementedError(f"not implemented: {mop.dstr()} of type {mop_descs[mop.t]}")
+    raise NotImplementedError(f"未实现: {mop.dstr()} 类型 {mop_descs[mop.t]}")
 
 def _store_as(l: ir.Value, d: ir.Value, blk: ir.Block, builder: ir.IRBuilder, d_typ: ir.Type = None, signed: bool = True):
     """
-    Private helper function to store value to destination.
+    将值存储到目标地址的私有辅助函数。
     """
-    if d is None:  # destination does not exist
+    if d is None:  # 目标不存在
         return l
 
     d = dedereference(d)
@@ -1016,7 +1073,7 @@ def _store_as(l: ir.Value, d: ir.Value, blk: ir.Block, builder: ir.IRBuilder, d_
 
 def create_intrinsic_function(module: ir.Module, func_name: str, ftif):
     """
-    This function create intrinsic function for IDA helper function.
+    为IDA辅助函数创建内置函数。
     """
     argtypes = []
     for arg in ftif.args:
@@ -1027,94 +1084,41 @@ def create_intrinsic_function(module: ir.Module, func_name: str, ftif):
         rettype = i8ptr
     return module.declare_intrinsic(func_name, fnty=ir.FunctionType(rettype, argtypes))
 
-def float_type(size):
+def float_type(size: int) -> ir.Type:
     """
-    This function return point type for specific size.
-    error: llvmlite do not has long double
+    根据给定的大小返回适当的LLVM浮点类型。
+    
+    注意：llvmlite不支持long double，所以大小 > 8 的默认为double。
+    
+    :param size: 字节大小（4为float，8为double）
+    :return: LLVM FloatType 或 DoubleType
     """
-    if size == 4:
-        typ = ir.FloatType()
-    elif size == 8:
-        typ = ir.DoubleType()
-    else:
-        typ = ir.DoubleType()
-    return typ
- 
-def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilder) -> ir.Instruction:
+    return ir.FloatType() if size == 4 else ir.DoubleType()
+
+# ============================================================================
+# 指令提升辅助函数
+# ============================================================================
+
+def _handle_binary_arithmetic(l, r, d, op_func, blk, builder, ida_insn, allow_ptr=False):
     """
-    This function lift microcode insn into llvm in following steps:
-    1. Lift left, right and destination mop for each instruction.
-    2. Lift instruction.
-
-    ida_insn: microcode insn
-    blk: current llvm block
-    builder: llvm builder
+    处理二元算术运算（加、减、乘、除等）的辅助函数。
+    
+    :param l: 左操作数
+    :param r: 右操作数
+    :param d: 目标
+    :param op_func: 操作函数（例如 builder.add, builder.mul）
+    :param blk: 当前基本块
+    :param builder: IR构建器
+    :param ida_insn: IDA指令（用于获取大小信息）
+    :param allow_ptr: 是否允许指针算术
     """
-    builder.position_at_end(blk)
-    l = lift_mop(ida_insn.l, blk, builder)
-    # The load src is always address
-    r = lift_mop(ida_insn.r, blk, builder, ida_insn.opcode == ida_hexrays.m_ldx)
-    # The insn dest is always address except dest is call dest (arguments)
-    d = lift_mop(ida_insn.d, blk, builder, True and ida_insn.opcode != ida_hexrays.m_call and ida_insn.opcode != ida_hexrays.m_icall)
+    # 先将浮点数转换为整数（用于整数运算）
+    if isinstance(l.type, (ir.FloatType, ir.DoubleType)):
+        l = builder.fptoui(l, ir.IntType(ida_insn.l.size*8))
+    if isinstance(r.type, (ir.FloatType, ir.DoubleType)):
+        r = builder.fptoui(r, ir.IntType(ida_insn.r.size*8))
 
-    # create declaration for unknown intrinsic function
-    if ida_insn.l.t == ida_hexrays.mop_h and l == None:
-        l = create_intrinsic_function(blk.parent.parent, ida_insn.l.helper, ida_insn.d.f)
-
-    blk_itr = iter(blk.parent.blocks)
-    list(itertools.takewhile(lambda x: x.name != blk.name, blk_itr))
-    # get next block
-    next_blk = next(blk_itr, None)
-
-    if ida_insn.opcode == ida_hexrays.m_nop:    # 0x00,  nop    no operation
-        return
-    elif ida_insn.opcode == ida_hexrays.m_stx:  # 0x01,  stx  l,    {r=sel, d=off}  store value to memory
-        d = storecast(l, d, builder)
-        return _store_as(l, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_ldx:  # 0x02,  ldx  {l=sel,r=off}, d load load value from memory
-        if not ida_insn.is_fpinsn():            # maybe ldx.fpu
-            typ = ir.IntType(ida_insn.d.size * 8)
-        else:
-            typ = float_type(ida_insn.d.size * 8)
-        r = typecast(r, typ.as_pointer(), builder)  
-        r = builder.load(r)
-        d = storecast(r, d, builder)
-        return _store_as(r, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_ldc:  # 0x03,  ldc  l=const,d   load constant
-        r = ir.Constant(ir.IntType(32), ida_insn.l.nnn)
-        return _store_as(r, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_mov:  # 0x04,  mov  l, d   move*F
-        d = storecast(l, d, builder)
-        return _store_as(l, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_neg:  # 0x05,  neg  l, d   negate
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        l = builder.neg(l)
-        d = storecast(l, d, builder)
-        return _store_as(l, d, blk, builder)    
-    elif ida_insn.opcode == ida_hexrays.m_lnot:  # 0x06,  lnot l, d   logical not
-        r = ir.IntType(ida_insn.l.size*8)(0)
-        r = typecast(r, l.type, builder)  
-        cmp = builder.icmp_unsigned("==", l, r)
-        d = storecast(cmp, d, builder)
-        return _store_as(cmp, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_bnot:  # 0x07,  bnot l, d   bitwise not
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        l = builder.not_(l)
-        return _store_as(l, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_xds:  # 0x08,  xds  l, d   extend (signed)
-        return _store_as(l, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_xdu:  # 0x09,  xdu  l, d   extend (unsigned)
-        return _store_as(l, d, blk, builder, signed=False)
-    elif ida_insn.opcode == ida_hexrays.m_low:  # 0x0A,  low  l, d   take low part
-        return _store_as(l, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_high:  # 0x0B,  high l, d   take high part
-        return _store_as(l, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_add:  # 0x0C,  add  l,   r, d   l + r -> dst
-        if isinstance(l.type, ir.FloatType) or isinstance(l.type, ir.DoubleType):
-            l = builder.fptoui(l, ir.IntType(ida_insn.l.size*8))
-        if isinstance(r.type, ir.FloatType) or isinstance(r.type, ir.DoubleType):
-            r = builder.fptoui(r, ir.IntType(ida_insn.r.size*8))
-
+    if allow_ptr:
         if isinstance(l.type, ir.PointerType) and isinstance(r.type, ir.IntType):
             castPtr = typecast(l, ir.IntType(8).as_pointer(), builder)
             math = builder.gep(castPtr, (r, ))
@@ -1124,17 +1128,161 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
             math = builder.gep(castPtr, (l, ))
             math = typecast(math, r.type, builder)
         elif isinstance(l.type, ir.IntType) and isinstance(r.type, ir.IntType):
-            math = builder.add(l, r)
+            math = op_func(l, r)
         elif isinstance(l.type, ir.PointerType) and isinstance(r.type, ir.PointerType):
-            ptrType = ir.IntType(64) # get pointer type
+            ptrType = ir.IntType(64)
             const1 = builder.ptrtoint(l, ptrType)
             const2 = builder.ptrtoint(r, ptrType)
-            math = builder.add(const1, const2)
+            math = op_func(const1, const2)
         else:
-            raise NotImplementedError("expected subtraction between pointer/integers")
+            raise NotImplementedError(f"不支持的操作数类型: {l.type} 和 {r.type}")
+    else:
+        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
+        r = typecast(r, ir.IntType(ida_insn.d.size*8), builder)
+        math = op_func(l, r)
+    
+    d = storecast(l, d, builder)
+    return _store_as(math, d, blk, builder)
+
+def _handle_comparison(l, r, d, cmp_op, blk, builder, ida_insn, signed=False):
+    """
+    处理比较操作（setz, setnz, setg 等）的辅助函数。
+    
+    :param l: 左操作数
+    :param r: 右操作数
+    :param d: 目标
+    :param cmp_op: 比较操作符 ('==', '!=', '>', '<', '>=', '<=')
+    :param blk: 当前基本块
+    :param builder: IR构建器
+    :param ida_insn: IDA指令（用于获取大小信息）
+    :param signed: 是否使用有符号比较
+    """
+    l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
+    r = typecast(r, ir.IntType(ida_insn.r.size*8), builder)
+    
+    if signed:
+        cond = builder.icmp_signed(cmp_op, l, r)
+    else:
+        cond = builder.icmp_unsigned(cmp_op, l, r)
+    
+    result = builder.select(cond, 
+                           ir.IntType(ida_insn.d.size * 8)(1), 
+                           ir.IntType(ida_insn.d.size * 8)(0))
+    return _store_as(result, d, blk, builder)
+
+def _handle_conditional_jump(l, r, d, next_blk, cmp_op, builder, ida_insn, signed=False):
+    """
+    处理条件跳转操作（jz, jnz, jg, jl 等）的辅助函数。
+    
+    :param l: 左操作数
+    :param r: 右操作数
+    :param d: 目标块
+    :param next_blk: 顺序执行的下一个块
+    :param cmp_op: 比较操作符
+    :param builder: IR构建器
+    :param ida_insn: IDA指令（用于获取大小信息）
+    :param signed: 是否使用有符号比较
+    """
+    l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
+    r = typecast(r, ir.IntType(ida_insn.r.size*8), builder)
+    
+    if signed:
+        cond = builder.icmp_signed(cmp_op, l, r)
+    else:
+        cond = builder.icmp_unsigned(cmp_op, l, r)
+    
+    return builder.cbranch(cond, d, next_blk)
+
+def _handle_float_binary_op(l, r, d, op_func, blk, builder, ida_insn):
+    """
+    处理浮点二元运算（fadd, fsub, fmul, fdiv）的辅助函数。
+    """
+    typ = float_type(ida_insn.l.size)
+    l = typecast(l, typ, builder)
+    r = typecast(r, typ, builder)
+    math = op_func(l, r)
+    d = storecast(l, d, builder)
+    return _store_as(math, d, blk, builder)
+ 
+def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilder) -> ir.Instruction:
+    """
+    Lifts a single IDA microcode instruction to LLVM IR.
+    
+    This is the main instruction translation function. It processes IDA Hexrays
+    microcode instructions and emits corresponding LLVM IR instructions.
+    
+    Process:
+    1. Lift left operand (l), right operand (r), and destination (d)
+    2. Handle special cases (load operations use addresses, not values)
+    3. Create unknown intrinsic functions if needed (mop_h helpers)
+    4. Dispatch to appropriate handler based on opcode
+    
+    :param ida_insn: IDA microcode instruction to lift
+    :param blk: Current LLVM basic block
+    :param builder: LLVM IR builder for emitting instructions
+    :return: The generated LLVM instruction, or None for no-ops
+    """
+    builder.position_at_end(blk)
+    l = lift_mop(ida_insn.l, blk, builder)
+    # 加载操作的源始终是地址
+    r = lift_mop(ida_insn.r, blk, builder, ida_insn.opcode == ida_hexrays.m_ldx)
+    # 指令目标始终是地址，除非call指令的目标（参数）
+    d = lift_mop(ida_insn.d, blk, builder, True and ida_insn.opcode != ida_hexrays.m_call and ida_insn.opcode != ida_hexrays.m_icall)
+
+    # 为未知的内置函数创建声明
+    if ida_insn.l.t == ida_hexrays.mop_h and l == None:
+        l = create_intrinsic_function(blk.parent.parent, ida_insn.l.helper, ida_insn.d.f)
+
+    blk_itr = iter(blk.parent.blocks)
+    list(itertools.takewhile(lambda x: x.name != blk.name, blk_itr))
+    # 获取下一个块
+    next_blk = next(blk_itr, None)
+
+    if ida_insn.opcode == ida_hexrays.m_nop:    # 0x00,  nop    无操作
+        return
+    elif ida_insn.opcode == ida_hexrays.m_stx:  # 0x01,  stx  l,    {r=sel, d=off}  存储值到内存
         d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder) 
+        return _store_as(l, d, blk, builder)
+    elif ida_insn.opcode == ida_hexrays.m_ldx:  # 0x02,  ldx  {l=sel,r=off}, d load 从内存加载值
+        # 根据是否是FPU指令确定类型
+        typ = float_type(ida_insn.d.size) if ida_insn.is_fpinsn() else ir.IntType(ida_insn.d.size * 8)
+        r = typecast(r, typ.as_pointer(), builder)  
+        r = builder.load(r)
+        d = storecast(r, d, builder)
+        return _store_as(r, d, blk, builder)
+    elif ida_insn.opcode == ida_hexrays.m_ldc:  # 0x03,  ldc  l=const,d   加载常量
+        r = ir.Constant(ir.IntType(32), ida_insn.l.nnn)
+        return _store_as(r, d, blk, builder)
+    elif ida_insn.opcode == ida_hexrays.m_mov:  # 0x04,  mov  l, d   移动
+        d = storecast(l, d, builder)
+        return _store_as(l, d, blk, builder)
+    elif ida_insn.opcode == ida_hexrays.m_neg:  # 0x05,  neg  l, d   取负
+        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
+        l = builder.neg(l)
+        d = storecast(l, d, builder)
+        return _store_as(l, d, blk, builder)    
+    elif ida_insn.opcode == ida_hexrays.m_lnot:  # 0x06,  lnot l, d   逻辑非
+        r = ir.IntType(ida_insn.l.size*8)(0)
+        r = typecast(r, l.type, builder)  
+        cmp = builder.icmp_unsigned("==", l, r)
+        d = storecast(cmp, d, builder)
+        return _store_as(cmp, d, blk, builder)
+    elif ida_insn.opcode == ida_hexrays.m_bnot:  # 0x07,  bnot l, d   按位非
+        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
+        l = builder.not_(l)
+        return _store_as(l, d, blk, builder)
+    elif ida_insn.opcode == ida_hexrays.m_xds:  # 0x08,  xds  l, d   符号扩展
+        return _store_as(l, d, blk, builder)
+    elif ida_insn.opcode == ida_hexrays.m_xdu:  # 0x09,  xdu  l, d   无符号扩展
+        return _store_as(l, d, blk, builder, signed=False)
+    elif ida_insn.opcode == ida_hexrays.m_low:  # 0x0A,  low  l, d   取低位部分
+        return _store_as(l, d, blk, builder)
+    elif ida_insn.opcode == ida_hexrays.m_high:  # 0x0B,  high l, d   取高位部分
+        return _store_as(l, d, blk, builder)
+    elif ida_insn.opcode == ida_hexrays.m_add:  # 0x0C,  add  l,   r, d   l + r -> dst
+        return _handle_binary_arithmetic(l, r, d, builder.add, blk, builder, ida_insn, allow_ptr=True) 
     elif ida_insn.opcode == ida_hexrays.m_sub:  # 0x0D,  sub  l,   r, d   l - r -> dst
+        # 减法的特殊处理，指针减法需要取负
         if isinstance(l.type, ir.FloatType) or isinstance(l.type, ir.DoubleType):
             l = builder.fptoui(l, ir.IntType(ida_insn.l.size*8))
         if isinstance(r.type, ir.FloatType) or isinstance(r.type, ir.DoubleType):
@@ -1153,7 +1301,7 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         elif isinstance(l.type, ir.IntType) and isinstance(r.type, ir.IntType):
             math = builder.sub(l, r)
         elif isinstance(l.type, ir.PointerType) and isinstance(r.type, ir.PointerType):
-            ptrType = ir.IntType(64) # get pointer type
+            ptrType = ir.IntType(64)
             const1 = builder.ptrtoint(l, ptrType)
             const2 = builder.ptrtoint(r, ptrType)
             math = builder.sub(const1, const2)
@@ -1162,71 +1310,27 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         d = storecast(l, d, builder)
         return _store_as(math, d, blk, builder) 
     elif ida_insn.opcode == ida_hexrays.m_mul:  # 0x0E,  mul  l,   r, d   l * r -> dst
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.d.size*8), builder)
-        math = builder.mul(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
+        return _handle_binary_arithmetic(l, r, d, builder.mul, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_udiv:  # 0x0F,  udiv l,   r, d   l / r -> dst
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.d.size*8), builder)
-        math = builder.udiv(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
+        return _handle_binary_arithmetic(l, r, d, builder.udiv, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_sdiv:  # 0x10,  sdiv l,   r, d   l / r -> dst
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.d.size*8), builder)
-        d = storecast(l, d, builder)
-        math = builder.sdiv(l, r)
-        return _store_as(math, d, blk, builder)
+        return _handle_binary_arithmetic(l, r, d, builder.sdiv, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_umod:  # 0x11,  umod l,   r, d   l % r -> dst
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.d.size*8), builder)
-        math = builder.urem(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
+        return _handle_binary_arithmetic(l, r, d, builder.urem, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_smod:  # 0x12,  smod l,   r, d   l % r -> dst
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.d.size*8), builder)
-        math = builder.srem(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
+        return _handle_binary_arithmetic(l, r, d, builder.srem, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_or:  # 0x13,  or   l,   r, d   bitwise or
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.d.size*8), builder)
-        math = builder.or_(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
+        return _handle_binary_arithmetic(l, r, d, builder.or_, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_and:  # 0x14,  and  l,   r, d   bitwise and
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.d.size*8), builder)
-        math = builder.and_(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
+        return _handle_binary_arithmetic(l, r, d, builder.and_, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_xor:  # 0x15,  xor  l,   r, d   bitwise xor
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.d.size*8), builder)
-        math = builder.xor(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
+        return _handle_binary_arithmetic(l, r, d, builder.xor, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_shl:  # 0x16,  shl  l,   r, d   shift logical left
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.d.size*8), builder)        
-        math = builder.shl(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
+        return _handle_binary_arithmetic(l, r, d, builder.shl, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_shr:  # 0x17,  shr  l,   r, d   shift logical right
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.d.size*8), builder)        
-        math = builder.ashr(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
+        return _handle_binary_arithmetic(l, r, d, builder.ashr, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_sar:  # 0x18,  sar  l,   r, d   shift arithmetic right
-        l = typecast(l, ir.IntType(ida_insn.d.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.d.size*8), builder)        
-        math = builder.ashr(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
+        return _handle_binary_arithmetic(l, r, d, builder.ashr, blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_cfadd:  # 0x19,  cfadd l,  r,    d=carry    calculate carry    bit of (l+r)
         l = typecast(l, ir.IntType(64), builder)
         r = typecast(r, ir.IntType(64), builder)
@@ -1286,118 +1390,48 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         l = builder.call(f_setp, [l, ir.Constant(ir.IntType(32), ida_insn.d.size)])
         return _store_as(l, d, blk, builder)
     elif ida_insn.opcode == ida_hexrays.m_setnz:  # 0x20,  setnz l,  r, d=byte  ZF=0Not Equal    *F
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_unsigned("!=", l, r)
-        result = builder.select(cond, ir.IntType(ida_insn.d.size * 8)(1), ir.IntType(ida_insn.d.size * 8)(0))
-        return _store_as(result, d, blk, builder)
+        return _handle_comparison(l, r, d, "!=", blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_setz:  # 0x21,  setz  l,  r, d=byte  ZF=1Equal   *F
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_unsigned("==", l, r)
-        result = builder.select(cond, ir.IntType(ida_insn.d.size * 8)(1), ir.IntType(ida_insn.d.size * 8)(0))
-        return _store_as(result, d, blk, builder)
+        return _handle_comparison(l, r, d, "==", blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_setae:  # 0x22,  setae l,  r, d=byte  CF=0Above or Equal    *F
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_unsigned(">=", l, r)
-        result = builder.select(cond, ir.IntType(ida_insn.d.size * 8)(1), ir.IntType(ida_insn.d.size * 8)(0))
-        return _store_as(result, d, blk, builder)
+        return _handle_comparison(l, r, d, ">=", blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_setb:  # 0x23,  setb  l,  r, d=byte  CF=1Below   *F
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_unsigned("<", l, r)
-        result = builder.select(cond, ir.IntType(ida_insn.d.size * 8)(1), ir.IntType(ida_insn.d.size * 8)(0))
-        return _store_as(result, d, blk, builder)
+        return _handle_comparison(l, r, d, "<", blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_seta:  # 0x24,  seta  l,  r, d=byte  CF=0 & ZF=0   Above   *F
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_unsigned(">", l, r)
-        result = builder.select(cond, ir.IntType(ida_insn.d.size * 8)(1), ir.IntType(ida_insn.d.size * 8)(0))
-        return _store_as(result, d, blk, builder)
+        return _handle_comparison(l, r, d, ">", blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_setbe:  # 0x25,  setbe l,  r, d=byte  CF=1 | ZF=1   Below or Equal    *F
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_unsigned("<=", l, r)
-        result = builder.select(cond, ir.IntType(ida_insn.d.size * 8)(1), ir.IntType(ida_insn.d.size * 8)(0))
-        return _store_as(result, d, blk, builder)
+        return _handle_comparison(l, r, d, "<=", blk, builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_setg:  # 0x26,  setg  l,  r, d=byte  SF=OF & ZF=0  Greater
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_signed(">", l, r)
-        result = builder.select(cond, ir.IntType(ida_insn.d.size * 8)(1), ir.IntType(ida_insn.d.size * 8)(0))
-        return _store_as(result, d, blk, builder)
+        return _handle_comparison(l, r, d, ">", blk, builder, ida_insn, signed=True)
     elif ida_insn.opcode == ida_hexrays.m_setge:  # 0x27,  setge l,  r, d=byte  SF=OF    Greater or Equal
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_signed(">=", l, r)
-        result = builder.select(cond, ir.IntType(ida_insn.d.size * 8)(1), ir.IntType(ida_insn.d.size * 8)(0))
-        return _store_as(result, d, blk, builder)
+        return _handle_comparison(l, r, d, ">=", blk, builder, ida_insn, signed=True)
     elif ida_insn.opcode == ida_hexrays.m_setl:  # 0x28,  setl  l,  r, d=byte  SF!=OF   Less
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_signed("<", l, r)
-        result = builder.select(cond, ir.IntType(ida_insn.d.size * 8)(1), ir.IntType(ida_insn.d.size * 8)(0))
-        return _store_as(result, d, blk, builder)
+        return _handle_comparison(l, r, d, "<", blk, builder, ida_insn, signed=True)
     elif ida_insn.opcode == ida_hexrays.m_setle:  # 0x29,  setle l,  r, d=byte  SF!=OF | ZF=1 Less or Equal
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_signed("<=", l, r)
-        result = builder.select(cond, ir.IntType(ida_insn.d.size * 8)(1), ir.IntType(ida_insn.d.size * 8)(0))
-        return _store_as(result, d, blk, builder)
+        return _handle_comparison(l, r, d, "<=", blk, builder, ida_insn, signed=True)
     elif ida_insn.opcode == ida_hexrays.m_jcnd:  # 0x2A,  jcnd   l,    d   d is mop_v or mop_b
         l = typecast(l, ir.IntType(1), builder)
         return builder.cbranch(l, d, next_blk)
     elif ida_insn.opcode == ida_hexrays.m_jnz:  # 0x2B,  jnz    l, r, d   ZF=0Not Equal *F
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_unsigned("!=", l, r)
-        return builder.cbranch(cond, d, next_blk)
+        return _handle_conditional_jump(l, r, d, next_blk, "!=", builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_jz:  # 0x2C,  jzl, r, d   ZF=1Equal*F
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_unsigned("==", l, r)
-        return builder.cbranch(cond, d, next_blk)
+        return _handle_conditional_jump(l, r, d, next_blk, "==", builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_jae:  # 0x2D,  jae    l, r, d   CF=0Above or Equal *F
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder)  
-        cond = builder.icmp_unsigned(">=", l, r)
-        return builder.cbranch(cond, d, next_blk)
+        return _handle_conditional_jump(l, r, d, next_blk, ">=", builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_jb:  # 0x2E,  jbl, r, d   CF=1Below*F
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_unsigned("<", l, r)
-        return builder.cbranch(cond, d, next_blk)
+        return _handle_conditional_jump(l, r, d, next_blk, "<", builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_ja:  # 0x2F,  jal, r, d   CF=0 & ZF=0   Above*F
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder)  
-        cond = builder.icmp_unsigned(">", l, r)
-        return builder.cbranch(cond, d, next_blk)
+        return _handle_conditional_jump(l, r, d, next_blk, ">", builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_jbe:  # 0x30,  jbe    l, r, d   CF=1 | ZF=1   Below or Equal *F
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_unsigned("<=", l, r)
-        return builder.cbranch(cond, d, next_blk)
+        return _handle_conditional_jump(l, r, d, next_blk, "<=", builder, ida_insn)
     elif ida_insn.opcode == ida_hexrays.m_jg:  # 0x31,  jgl, r, d   SF=OF & ZF=0  Greater
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_signed(">", l, r)
-        return builder.cbranch(cond, d, next_blk)
+        return _handle_conditional_jump(l, r, d, next_blk, ">", builder, ida_insn, signed=True)
     elif ida_insn.opcode == ida_hexrays.m_jge:  # 0x32,  jge    l, r, d   SF=OF    Greater or Equal
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_signed(">=", l, r)
-        return builder.cbranch(cond, d, next_blk)
+        return _handle_conditional_jump(l, r, d, next_blk, ">=", builder, ida_insn, signed=True)
     elif ida_insn.opcode == ida_hexrays.m_jl:  # 0x33,  jll, r, d   SF!=OF   Less
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_signed("<", l, r)
-        return builder.cbranch(cond, d, next_blk)
+        return _handle_conditional_jump(l, r, d, next_blk, "<", builder, ida_insn, signed=True)
     elif ida_insn.opcode == ida_hexrays.m_jle:  # 0x34,  jle    l, r, d   SF!=OF | ZF=1 Less or Equal
-        l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        r = typecast(r, ir.IntType(ida_insn.r.size*8), builder) 
-        cond = builder.icmp_signed("<=", l, r)
-        return builder.cbranch(cond, d, next_blk)
+        return _handle_conditional_jump(l, r, d, next_blk, "<=", builder, ida_insn, signed=True)
     elif ida_insn.opcode == ida_hexrays.m_jtbl:  # 0x35,  jtbl   l, r=mcases    Table jump
         l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
         if "default" in r:
@@ -1410,9 +1444,9 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         return switch
     elif ida_insn.opcode == ida_hexrays.m_ijmp:  # 0x36,  ijmp  {r=sel, d=off}  indirect unconditional jump
         return
-    elif ida_insn.opcode == ida_hexrays.m_goto:  # 0x37,  goto   l    l is mop_v or mop_b
+    elif ida_insn.opcode == ida_hexrays.m_goto:  # 0x37,  goto   l    l是mop_v或mop_b
         return builder.branch(l)
-    elif ida_insn.opcode == ida_hexrays.m_call:  # 0x38,  call   ld   l is mop_v or mop_b or mop_h
+    elif ida_insn.opcode == ida_hexrays.m_call:  # 0x38,  call   ld   l是mop_v或mop_b或mop_h
         rets, args = d
         if not isinstance(l.type, ir.PointerType) or not isinstance(l.type.pointee, ir.FunctionType):
             argtype = []
@@ -1435,7 +1469,7 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         
         args = args[:len(l.type.pointee.args)]
         
-        if l.type.pointee.var_arg: # function is variadic
+        if l.type.pointee.var_arg: # 函数是可变参数
             ltype = l.type.pointee
             newargs = list(ltype.args)
             for i in range(len(newargs), len(args)):
@@ -1446,191 +1480,215 @@ def lift_insn(ida_insn: ida_hexrays.minsn_t, blk: ir.Block, builder: ir.IRBuilde
         for dst in rets:
             _store_as(ret, dst, blk, builder) 
         return ret
-    elif ida_insn.opcode == ida_hexrays.m_icall:  # 0x39,  icall  {l=sel, r=off} d    indirect call
+    elif ida_insn.opcode == ida_hexrays.m_icall:  # 0x39,  icall  {l=sel, r=off} d    间接调用
         rets, args = d
         ftype = ir.FunctionType(ir.IntType(8).as_pointer(), (arg.type for arg in args))
         f = typecast(r, ftype.as_pointer(), builder)
         return builder.call(f, args)
-    elif ida_insn.opcode == ida_hexrays.m_ret:  # 0x3A,  ret
+    elif ida_insn.opcode == ida_hexrays.m_ret:  # 0x3A,  ret  返回
         return
-    elif ida_insn.opcode == ida_hexrays.m_push:  # 0x3B,  push   l
+    elif ida_insn.opcode == ida_hexrays.m_push:  # 0x3B,  push   l  入栈
         return
-    elif ida_insn.opcode == ida_hexrays.m_pop:  # 0x3C,  popd
+    elif ida_insn.opcode == ida_hexrays.m_pop:  # 0x3C,  popd  出栈
         return
-    elif ida_insn.opcode == ida_hexrays.m_und:  # 0x3D,  undd   undefine
+    elif ida_insn.opcode == ida_hexrays.m_und:  # 0x3D,  undd   未定义
         return
-    elif ida_insn.opcode == ida_hexrays.m_ext:  # 0x3E,  ext  in1, in2,  out1  external insn, not microcode *F
+    elif ida_insn.opcode == ida_hexrays.m_ext:  # 0x3E,  ext  in1, in2,  out1  外部指令，不是微代码 *F
         return
-    elif ida_insn.opcode == ida_hexrays.m_f2i:  # 0x3F,  f2il,    d int(l) => d; convert fp -> integer   +F
+    elif ida_insn.opcode == ida_hexrays.m_f2i:  # 0x3F,  f2il,    d int(l) => d; 浮点 -> 整数   +F
         return typecast(l, ir.IntType(ida_insn.d.size * 8), builder, signed=True)
-    elif ida_insn.opcode == ida_hexrays.m_f2u:  # 0x40,  f2ul,    d uint(l)=> d; convert fp -> uinteger  +F
+    elif ida_insn.opcode == ida_hexrays.m_f2u:  # 0x40,  f2ul,    d uint(l)=> d; 浮点 -> 无符号整数  +F
         return typecast(l, ir.IntType(ida_insn.d.size * 8), builder, signed=False)
-    elif ida_insn.opcode == ida_hexrays.m_i2f:  # 0x41,  i2fl,    d fp(l)  => d; convert integer -> fp e +F
+    elif ida_insn.opcode == ida_hexrays.m_i2f:  # 0x41,  i2fl,    d fp(l)  => d; 整数 -> 浮点 +F
         l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        if ida_insn.d.size == 4:
-            typ = ir.FloatType()
-        elif ida_insn.d.size == 8:
-            typ = ir.DoubleType()
-        else:
-            typ = ir.DoubleType()      
+        typ = float_type(ida_insn.d.size)
         return builder.sitofp(l, typ)
-    elif ida_insn.opcode == ida_hexrays.m_u2f:  # 0x42,  i2fl,    d fp(l)  => d; convert uinteger -> fp  +F
+    elif ida_insn.opcode == ida_hexrays.m_u2f:  # 0x42,  i2fl,    d fp(l)  => d; 无符号整数 -> 浮点  +F
         l = typecast(l, ir.IntType(ida_insn.l.size*8), builder)
-        if ida_insn.d.size == 4:
-            typ = ir.FloatType()
-        elif ida_insn.d.size == 8:
-            typ = ir.DoubleType()
-        else:
-            typ = ir.DoubleType()   
+        typ = float_type(ida_insn.d.size)
         return builder.uitofp(l, typ)
-    elif ida_insn.opcode == ida_hexrays.m_f2f:  # 0x43,  f2fl,    d l => d; change fp precision+F
-        if ida_insn.d.size == 4:
-            l = typecast(l, ir.FloatType(), builder)
-            if d != None and d.type != ir.FloatType().as_pointer():
-                d = typecast(d, ir.FloatType().as_pointer(), builder)
-
-        if ida_insn.d.size == 8:
-            l = typecast(l, ir.DoubleType(), builder)
-            if d != None and d.type != ir.DoubleType().as_pointer():
-                d = typecast(d, ir.DoubleType().as_pointer(), builder)
-
-        if ida_insn.d.size == 16:
-            l = typecast(l, ir.DoubleType(), builder)
-            if d != None and d.type != ir.DoubleType().as_pointer():
-                d = typecast(d, ir.DoubleType().as_pointer(), builder)
+    elif ida_insn.opcode == ida_hexrays.m_f2f:  # 0x43,  f2fl,    d l => d; 改变浮点精度+F
+        target_type = float_type(ida_insn.d.size)
+        l = typecast(l, target_type, builder)
+        if d != None and d.type != target_type.as_pointer():
+            d = typecast(d, target_type.as_pointer(), builder)
         return _store_as(l, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_fneg:  # 0x44,  fneg    l,    d -l=> d; change sign   +F
+    elif ida_insn.opcode == ida_hexrays.m_fneg:  # 0x44,  fneg    l,    d -l=> d; 改变符号   +F
         return _store_as(l, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_fadd:  # 0x45,  fadd    l, r, d l + r  => d; add +F
-        if ida_insn.l.size == 4:
-            typ = ir.FloatType()
-        elif ida_insn.l.size == 8:
-            typ = ir.DoubleType()
-        else:
-            typ = ir.DoubleType() 
-        
-        l = typecast(l, typ, builder)
-        r = typecast(r, typ, builder)
-        math = builder.fadd(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_fsub:  # 0x46,  fsub    l, r, d l - r  => d; subtract +F
-        if ida_insn.l.size == 4:
-            typ = ir.FloatType()
-        elif ida_insn.l.size == 8:
-            typ = ir.DoubleType()
-        else:
-            typ = ir.DoubleType() 
-        
-        l = typecast(l, typ, builder)
-        r = typecast(r, typ, builder)
-        math = builder.fsub(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_fmul:  # 0x47,  fmul    l, r, d l * r  => d; multiply +F
-        if ida_insn.l.size == 4:
-            typ = ir.FloatType()
-        elif ida_insn.l.size == 8:
-            typ = ir.DoubleType()
-        else:
-            typ = ir.DoubleType() 
-        
-        l = typecast(l, typ, builder)
-        r = typecast(r, typ, builder)
-        math = builder.fmul(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
-    elif ida_insn.opcode == ida_hexrays.m_fdiv:  # 0x48,  fdiv    l, r, d l / r  => d; divide   +F
-        if ida_insn.l.size == 4:
-            typ = ir.FloatType()
-        elif ida_insn.l.size == 8:
-            typ = ir.DoubleType()
-        else:
-            typ = ir.DoubleType() 
-        
-        l = typecast(l, typ, builder)
-        r = typecast(r, typ, builder)
-        math = builder.fdiv(l, r)
-        d = storecast(l, d, builder)
-        return _store_as(math, d, blk, builder)
+    elif ida_insn.opcode == ida_hexrays.m_fadd:  # 0x45,  fadd    l, r, d l + r  => d; 浮点加法 +F
+        return _handle_float_binary_op(l, r, d, builder.fadd, blk, builder, ida_insn)
+    elif ida_insn.opcode == ida_hexrays.m_fsub:  # 0x46,  fsub    l, r, d l - r  => d; 浮点减法 +F
+        return _handle_float_binary_op(l, r, d, builder.fsub, blk, builder, ida_insn)
+    elif ida_insn.opcode == ida_hexrays.m_fmul:  # 0x47,  fmul    l, r, d l * r  => d; 浮点乘法 +F
+        return _handle_float_binary_op(l, r, d, builder.fmul, blk, builder, ida_insn)
+    elif ida_insn.opcode == ida_hexrays.m_fdiv:  # 0x48,  fdiv    l, r, d l / r  => d; 浮点除法   +F
+        return _handle_float_binary_op(l, r, d, builder.fdiv, blk, builder, ida_insn)
     else:
-        raise NotImplementedError(f"not implemented {ida_insn.dstr()}")
+        raise NotImplementedError(f"未实现 {ida_insn.dstr()}")
 
 class BIN2LLVMController():
     """
-    The control component of BinaryLift Explorer.
+    IDA到LLVM IR翻译过程的主控制器。
+    
+    该类统筹完整的二进制到LLVM的提升工作流程：
+    1. 通过反编译所有函数并收集元数据来初始化
+    2. 为所有数据项创建LLVM全局变量
+    3. 将.text段函数提升为LLVM IR
+    4. 将生成的IR模块保存到文件
     """
-    def __init__(self):
+    def __init__(self, target_mode: str = "host"):
+        """使用空的LLVM模块初始化控制器。"""
         self.m = ir.Module()
+        self._name_cache = {}
+        self._func_cache = {}
+        if target_mode == "host":
+            self._set_module_target_from_host()
+        else:
+            self._set_module_target_from_ida()
+
+    def _get_name(self, ea):
+        name = self._name_cache.get(ea)
+        if name is None:
+            name = ida_name.get_name(ea)
+            self._name_cache[ea] = name
+        return name
+
+    def _get_func(self, ea):
+        func = self._func_cache.get(ea, "__missing__")
+        if func == "__missing__":
+            func = ida_funcs.get_func(ea)
+            self._func_cache[ea] = func
+        return func
+
+    def _set_module_target_from_host(self):
+        """Sets module target triple and data layout based on host LLVM."""
+        try:
+            llvm.initialize()
+            llvm.initialize_native_target()
+            llvm.initialize_native_asmprinter()
+            triple = llvm.get_default_triple()
+            target = llvm.Target.from_triple(triple)
+            target_machine = target.create_target_machine()
+            self.m.triple = triple
+            self.m.data_layout = str(target_machine.target_data)
+        except Exception as exc:
+            logging.warning(f"Failed to set module target from host: {exc}")
+
+    def _set_module_target_from_ida(self):
+        """Sets module target triple based on IDA's analysis information."""
+        try:
+            proc = ida_ida.inf_get_procname()
+            is_64 = ida_ida.inf_is_64bit()
+            arch = "unknown"
+
+            if proc == "metapc":
+                arch = "x86_64" if is_64 else "i386"
+            elif proc in ("arm", "ARM"):
+                arch = "aarch64" if is_64 else "arm"
+            elif proc in ("aarch64", "arm64"):
+                arch = "aarch64"
+            elif proc == "mips":
+                arch = "mips64" if is_64 else "mips"
+            elif proc in ("ppc", "ppc64"):
+                arch = "powerpc64" if is_64 else "powerpc"
+            elif proc == "riscv":
+                arch = "riscv64" if is_64 else "riscv32"
+
+            os_name = "unknown"
+            with suppress(Exception):
+                ostype = ida_ida.inf_get_ostype()
+                if hasattr(ida_ida, "OSTYPE_WIN") and ostype == ida_ida.OSTYPE_WIN:
+                    os_name = "windows"
+                elif hasattr(ida_ida, "OSTYPE_LINUX") and ostype == ida_ida.OSTYPE_LINUX:
+                    os_name = "linux"
+                elif hasattr(ida_ida, "OSTYPE_MACOS") and ostype == ida_ida.OSTYPE_MACOS:
+                    os_name = "darwin"
+
+            self.m.triple = f"{arch}-unknown-{os_name}"
+            self.m.data_layout = ""
+        except Exception as exc:
+            logging.warning(f"Failed to set module target from IDA: {exc}")
 
     def insertAllFunctions(self):
         """
-        This function lift all text functions into llvm.
+        将.text段的所有函数提升为LLVM IR。
+        
+        遍历二进制文件中的所有函数，并将.text段中的函数
+        翻译为LLVM IR表示。
         """
         for f_ea in idautils.Functions():
-            if idc.get_segm_name(f_ea) not in [".text"]:
-                continue
             self.insertFunctionAtEa(f_ea)
 
     def insertFunctionAtEa(self, ea):
         """
-        This function lift specific function into llvm.
+        将给定地址的特定函数提升为LLVM IR。
+        
+        :param ea: 要提升的函数的有效地址
         """
         if ea in ptext:
             typ = ptext[ea].type
-            func_name = ida_name.get_name(ea)
+            func_name = self._get_name(ea)
             lift_function(self.m, func_name, False, ea, typ)
 
     def create_global(self, ea, width, str_dict):
         """
-        This function create all known global variables in following steps.
-        1. get data item name and type.
-        2. create global variables.
-
-        ea: data address
-        width: data width in ea
-        str_dict: all known strings
+        Creates LLVM global variables for IDA data items.
+        
+        Process:
+        1. Extract data item name and type information from IDA
+        2. Handle special cases:
+           - Strings: Create constant string globals
+           - External functions: Create declarations
+           - Thunk functions: Resolve to actual target
+           - Data items: Create initialized global variables
+        
+        :param ea: Address of the data item
+        :param width: Size of the data item in bytes
+        :param str_dict: Dictionary mapping addresses to string data
         """
-        # get item name and get type information
-        name = ida_name.get_name(ea)
+        # 获取数据项名称和类型信息
+        name = self._get_name(ea)
         if name == "":
             name = f"data_{hex(ea)[2:]}"
 
-        tif = ida_typeinf.tinfo_t()
-        if not ida_nalt.get_tinfo(tif, ea):
-            ida_typeinf.guess_tinfo(tif, ea)
-        
-        # if data item is string, create string global variable.
+        # 如果数据项是字符串，创建字符串全局变量
         if ea in str_dict:
             str_csnt = str_dict[ea][0]
             strType = ir.ArrayType(ir.IntType(8), str_dict[ea][1])
             g = ir.GlobalVariable(self.m, strType, name=name)
             g.initializer = ir.Constant(strType, bytearray(str_csnt))
             g.linkage = "private"
-            g.global_constant = True 
+            g.global_constant = True
+            return
 
-        # if data item is extern function, create declaration.
+        tif = ida_typeinf.tinfo_t()
+        if not ida_nalt.get_tinfo(tif, ea):
+            ida_typeinf.guess_tinfo(tif, ea)
+
+        # 如果数据项是外部函数，创建声明
         elif tif.is_func() or tif.is_funcptr():
             if tif.is_funcptr():
                 tif = tif.get_ptrarr_object()
             # if function is a thunk function, define the actual function instead
-            if ((ida_funcs.get_func(ea) is not None)
-            and (ida_funcs.get_func(ea).flags & ida_funcs.FUNC_THUNK)): 
-                tfunc_ea, ptr = ida_funcs.calc_thunk_func_target(ida_funcs.get_func(ea))
+            func = self._get_func(ea)
+            if ((func is not None)
+            and (func.flags & ida_funcs.FUNC_THUNK)): 
+                tfunc_ea, ptr = ida_funcs.calc_thunk_func_target(func)
                 if tfunc_ea != ida_idaapi.BADADDR:
                     ea = tfunc_ea
-                    name = ida_name.get_name(ea)
+                    name = self._get_name(ea)
+                    func = self._get_func(ea)
             
-            # create definition for declaration function,
-            if ((ida_funcs.get_func(ea) is None)
-            # or if the function is a library function,
-            or (ida_funcs.get_func(ea).flags & ida_funcs.FUNC_LIB) 
-            # or if the function is declared in a XTRN segment,
+            # 为声明函数创建定义，
+            if ((func is None)
+            # 或者函数是库函数，
+            or (func.flags & ida_funcs.FUNC_LIB) 
+            # 或者函数在XTRN段中声明，
             or ida_segment.segtype(ea) & ida_segment.SEG_XTRN): 
-                # return function declaration
+                # 返回函数声明
                 g = lift_function(self.m, name, True, ea, tif)
 
-        # others data item, maybe int/float/arrary/structure                
+        # 其他数据项，可能是 int/float/数组/结构体
         else:
             typ = lift_tif(tif, width)
             g_cmt = lift_from_address(self.m, ea, typ)
@@ -1639,54 +1697,130 @@ class BIN2LLVMController():
 
     def initialize(self):
         """
-        This function serves as a initial function with following steps.
-        1. Decompile all functions.
-        2. Collect all strings.
-        3. Create GlobalVariabel for all IDA data item.
-
-        ptext: dict to save decompile results {ea:decompile}
-        str_dict: dict to save all strings
+        Initializes the LLVM module by preparing all necessary metadata.
+        
+        This crucial preparation step:
+        1. Decompiles all functions in the binary using IDA Hexrays
+        2. Collects all string constants identified by IDA
+        3. Creates LLVM global variables for all data items in non-executable segments
+        
+        The decompiled functions are cached in the global 'ptext' dictionary
+        for later use during function lifting.
+        
+        Note: Decompilation may fail for some functions (e.g., library stubs,
+        corrupted code), which are silently skipped.
         """
-        # decompile all functions
+        # 步骤1：反编译所有函数并缓存结果
         for func in idautils.Functions():
             try:
                 pfunc = ida_hexrays.decompile(func)
                 if pfunc != None:
                     ptext[func] = pfunc
-            except:
+            except Exception as e:
+                # 反编译可能因各种原因失败；跳过并继续
+                logging.debug(f"在 {hex(func)} 处反编译函数失败: {e}")
                 pass
 
-        # collect all strings identified by IDA
+        # 步骤2：收集所有字符串常量
         str_dict = {}
-        for s in list(idautils.Strings()):
+        for s in idautils.Strings():
             str_dict[s.ea] = [ida_bytes.get_bytes(s.ea, s.length), s.length]
 
-        # iterative all data item and create global variable
-        heads = list(idautils.Heads())
-        for i in range(len(heads) - 1):
-            start = heads[i]
-            segm = idaapi.getseg(heads[i])
-            if segm.perm & idaapi.SEGPERM_EXEC == 0:
-                # set data boundary
-                end = segm.end_ea if heads[i+1] > segm.end_ea else heads[i+1]
-                self.create_global(start, end - start, str_dict)
+        # 步骤3：为非执行段中的所有数据项创建全局变量
+        for i in range(idaapi.get_segm_qty()):
+            segm = idaapi.getnseg(i)
+            if segm is None:
+                continue
+            if segm.perm & idaapi.SEGPERM_EXEC:
+                continue
+            for head in idautils.Heads(segm.start_ea, segm.end_ea):
+                end = ida_bytes.get_item_end(head)
+                if end <= head:
+                    continue
+                self.create_global(head, end - head, str_dict)
 
     def save_to_file(self, filename):
         """
-        This function save IR module with text format.
+        将LLVM IR模块以文本格式保存到文件。
+        
+        输出的是人类可读的LLVM IR（.ll格式），可以：
+        - 使用clang/llc编译
+        - 使用opt优化
+        - 使用各种LLVM工具分析
+        
+        :param filename: 输出.ll文件的路径
         """
         with open(filename, 'w') as f:
             f.write(str(self.m))
 
 if __name__ == "__main__":
     """
-    This script run in IDApython.
-    output: The text IR file to be saved.
+    作为独立应用程序运行（使用 IDA Pro 9+ idalib）。
+    
+    用法：
+        python ida2llvm.py -f binary_file -o output.ll
+    
+    参数：
+        -f, --file: 要分析的二进制文件路径（required）
+        -o, --output: 生成的LLVM IR文件的输出路径（required）
+    
+    流程：
+        1. 使用 idalib 打开数据库并进行自动分析
+        2. 初始化控制器并准备元数据
+        3. 将所有.text段函数提升为LLVM IR
+        4. 将IR模块保存到指定文件
+        5. 关闭数据库
     """
-    idc.auto_wait()
-    output = idc.ARGV[1]
-    bin2llvm = BIN2LLVMController()
-    bin2llvm.initialize()
-    bin2llvm.insertAllFunctions()
-    bin2llvm.save_to_file(output)
-    idc.qexit(0)
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(
+        description="IDA2LLVM - Convert binary to LLVM IR using IDA Pro 9+ idalib"
+    )
+    parser.add_argument(
+        "-f", "--file", 
+        help="Binary file to be analyzed", 
+        type=str, 
+        required=True
+    )
+    parser.add_argument(
+        "-o", "--output", 
+        help="Output file for LLVM IR (.ll)", 
+        type=str, 
+        required=True
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        help="Enable verbose logging",
+        action="store_true",
+        default=False
+    )
+    parser.add_argument(
+        "--target",
+        help="Target triple source: host (default) or ida",
+        choices=["host", "ida"],
+        default="host"
+    )
+    
+    args = parser.parse_args()
+    
+    # 配置日志
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+    
+    try:
+        idapro.open_database(args.file, True)
+        ida_auto.auto_wait()
+        bin2llvm = BIN2LLVMController(target_mode=args.target)
+        bin2llvm.initialize()
+        bin2llvm.insertAllFunctions()
+        bin2llvm.save_to_file(args.output)
+        
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        idapro.close_database()
+
