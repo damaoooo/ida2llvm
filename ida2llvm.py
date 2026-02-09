@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import idapro  # 必须是第一个 import，用于 idalib
 import idc
 import ida_idaapi
@@ -18,12 +17,22 @@ import idaapi
 import logging
 import struct
 import numpy as np
+import traceback
 import sys
 import typer
 import llvmlite.binding as llvm
 from llvmlite import ir
 
 from contextlib import suppress
+
+# Log 输出到文件 ida2llvm.log
+logging.basicConfig(
+    filename='ida2llvm.log',
+    filemode='a',  # 追加模式
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 # ============================================================================
 # 常量定义
@@ -304,7 +313,12 @@ def lift_type_from_address(ea: int, pfunc=None):
         return function_tinfo
 
     if ea in ptext:
-        return ptext[ea].type
+        pfunc_cached = ptext.get(ea)
+        if pfunc_cached is not None and getattr(pfunc_cached, "type", None) is not None:
+            return pfunc_cached.type
+        # Stale or invalid cache entry, drop and fall back to IDA type info.
+        with suppress(KeyError):
+            del ptext[ea]
             
     tif = ida_typeinf.tinfo_t()
     has_tinfo = ida_nalt.get_tinfo(tif, ea)
@@ -1001,7 +1015,7 @@ def lift_mop(mop: ida_hexrays.mop_t, blk: ir.Block, builder: ir.IRBuilder, dest 
         # IDA获取浮点数值在某些情况下可能会崩溃
         try:
             fp = mop.fpc.fnum.float
-        except (AttributeError, ValueError) as e:
+        except (AttributeError, ValueError, SystemError) as e:
             logging.debug(f"Failed to extract float value: {e}, using default {DEFAULT_FLOAT_VALUE}")
             fp = DEFAULT_FLOAT_VALUE
         typ = float_type(mop.size)
@@ -1563,16 +1577,26 @@ class BIN2LLVMController():
     def _set_module_target_from_host(self):
         """Sets module target triple and data layout based on host LLVM."""
         try:
-            llvm.initialize()
-            llvm.initialize_native_target()
-            llvm.initialize_native_asmprinter()
+            # Try to initialize LLVM targets if available
+            try:
+                # These calls may raise deprecation warnings but are necessary for proper initialization
+                if hasattr(llvm, 'initialize_all_targets'):
+                    llvm.initialize_all_targets()
+                if hasattr(llvm, 'initialize_all_asmprinters'):
+                    llvm.initialize_all_asmprinters()
+            except:
+                # Initialization may fail in some environments, continue anyway
+                pass
+            
             triple = llvm.get_default_triple()
             target = llvm.Target.from_triple(triple)
             target_machine = target.create_target_machine()
             self.m.triple = triple
             self.m.data_layout = str(target_machine.target_data)
         except Exception as exc:
-            logging.warning(f"Failed to set module target from host: {exc}")
+            # If host mode fails, fall back to IDA mode
+            logging.debug(f"Host mode target setup failed: {exc}, falling back to IDA mode")
+            self._set_module_target_from_ida()
 
     def _set_module_target_from_ida(self):
         """Sets module target triple based on IDA's analysis information."""
@@ -1626,7 +1650,10 @@ class BIN2LLVMController():
         :param ea: 要提升的函数的有效地址
         """
         if ea in ptext:
-            typ = ptext[ea].type
+            pfunc = ptext.get(ea)
+            if pfunc is None or getattr(pfunc, "type", None) is None:
+                return
+            typ = pfunc.type
             func_name = self._get_name(ea)
             lift_function(self.m, func_name, False, ea, typ)
 
@@ -1752,6 +1779,89 @@ class BIN2LLVMController():
         """
         with open(filename, 'w') as f:
             f.write(str(self.m))
+
+
+# ============================================================================
+# 公开接口：供其他 Python 文件调用的函数
+# ============================================================================
+
+def lift_binary_to_llvm(
+    input_binary: str,
+    output_llvm_ir: str,
+    target_mode: str = "host",
+    verbose: bool = False
+) -> bool:
+    """
+    将二进制文件转换为 LLVM IR。
+    
+    这是一个简洁的函数接口，允许其他 Python 文件像调用普通函数一样
+    调用 IDA Lift 功能。
+    
+    参数:
+        input_binary (str): 输入的二进制文件路径
+        output_llvm_ir (str): 输出的 LLVM IR 文件路径 (.ll)
+        target_mode (str): 目标架构设置方式，可选值：
+            - "host": 使用当前主机的目标三元组（默认）
+            - "ida": 使用 IDA Pro 检测到的架构
+        verbose (bool): 是否打印详细日志（默认 False）
+    
+    返回值:
+        bool: 成功返回 True，失败返回 False
+    
+    异常处理:
+        所有异常都被捕获，函数不会抛出异常，而是返回 False
+    
+    使用示例:
+        >>> from Scripts.ida2llvm import lift_binary_to_llvm
+        >>> success = lift_binary_to_llvm(
+        ...     input_binary="/path/to/binary",
+        ...     output_llvm_ir="/path/to/output.ll"
+        ... )
+        >>> if success:
+        ...     print("转换成功！")
+        ... else:
+        ...     print("转换失败！")
+    """
+    if target_mode not in ("host", "ida"):
+        logging.error(f"Invalid target_mode '{target_mode}'. Must be 'host' or 'ida'")
+        return False
+    
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+    
+    try:
+        # Clear global caches to avoid stale entries across multiple binaries.
+        ptext.clear()
+        refreshed_funcs.clear()
+
+        # 打开 IDA 数据库
+        idapro.open_database(input_binary, True)
+        ida_auto.auto_wait()
+        
+        # 创建控制器并执行提升
+        bin2llvm = BIN2LLVMController(target_mode=target_mode)
+        bin2llvm.initialize()
+        bin2llvm.insertAllFunctions()
+        bin2llvm.save_to_file(output_llvm_ir)
+        
+        logging.info(f"Successfully lifted binary to LLVM IR: {output_llvm_ir}")
+        return True
+        
+    except Exception as e:
+
+        logging.error(f"Failed to lift binary: {e}", exc_info=verbose)
+        logging.error("".join(traceback.format_exc()))
+        return False
+        
+    finally:
+        # 关闭 IDA 数据库
+        try:
+            idapro.close_database()
+        except:
+            pass
+
 
 app = typer.Typer(
     add_completion=False,
